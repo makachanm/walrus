@@ -1946,7 +1946,7 @@ public:
         } else {
             pushByteCode(Walrus::JumpIfFalse(stackPos), WASMOpcode::IfOpcode);
         }
-        
+
         applyConditionHint(b.m_position, conditionHint, false);
         m_preprocessData.seenBranch();
     }

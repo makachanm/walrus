@@ -484,6 +484,135 @@ void JITCompiler::dump()
 
 #endif /* !NDEBUG */
 
+struct SwappableArms {
+    InstructionListItem* thenLast;
+    InstructionListItem* thenJump;
+    InstructionListItem* elseLast;
+};
+
+static bool findSwappableArms(Instruction* branch, SwappableArms& arms)
+{
+    ByteCode::Opcode opcode = branch->opcode();
+
+    if (opcode != ByteCode::JumpIfTrueOpcode && opcode != ByteCode::JumpIfFalseOpcode) {
+        return false;
+    }
+
+    ByteCodeOffsetValue* byteCode = reinterpret_cast<ByteCodeOffsetValue*>(branch->byteCode());
+
+    if (byteCode->branchHint() != ByteCodeOffsetValue::BranchHint::NotTaken) {
+        return false;
+    }
+
+    Label* elseLabel = branch->asExtended()->value().targetLabel;
+
+    if (elseLabel->branches().size() != 1) {
+        return false;
+    }
+
+    arms.thenLast = nullptr;
+    arms.thenJump = nullptr;
+
+    for (InstructionListItem* item = branch->next(); item != elseLabel; item = item->next()) {
+        if (item == nullptr) {
+            return false;
+        }
+
+        arms.thenLast = arms.thenJump;
+        arms.thenJump = item;
+    }
+
+    if (arms.thenLast == nullptr || !arms.thenJump->isInstruction()
+        || arms.thenJump->asInstruction()->opcode() != ByteCode::JumpOpcode) {
+        return false;
+    }
+
+    Label* endLabel = arms.thenJump->asInstruction()->asExtended()->value().targetLabel;
+    arms.elseLast = nullptr;
+
+    for (InstructionListItem* item = elseLabel->next(); item != endLabel; item = item->next()) {
+        if (item == nullptr) {
+            return false;
+        }
+
+        arms.elseLast = item;
+    }
+
+    if (arms.elseLast == nullptr) {
+        return false;
+    }
+
+    if (arms.elseLast->isInstruction()) {
+        switch (arms.elseLast->asInstruction()->opcode()) {
+        case ByteCode::JumpOpcode:
+        case ByteCode::BrTableOpcode:
+        case ByteCode::EndOpcode:
+        case ByteCode::ThrowOpcode:
+        case ByteCode::UnreachableOpcode:
+        case ByteCode::ReturnCallOpcode:
+        case ByteCode::ReturnCallIndirectOpcode:
+        case ByteCode::ReturnCallIndirectM64Opcode:
+        case ByteCode::ReturnCallRefOpcode:
+            return false;
+        default:
+            break;
+        }
+    }
+
+    for (InstructionListItem* item = branch->next(); item != endLabel; item = item->next()) {
+        if (!item->isLabel() || item == elseLabel) {
+            continue;
+        }
+
+        bool inThenArm = item->id() < elseLabel->id();
+        size_t first = inThenArm ? branch->id() : elseLabel->id();
+        size_t last = inThenArm ? arms.thenLast->id() : arms.elseLast->id();
+
+        for (auto it : item->asLabel()->branches()) {
+            if (it->id() <= first || it->id() > last) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+void JITCompiler::reorderHintedBranches()
+{
+    if (m_tryBlockStart < m_tryBlocks.size()) {
+        return;
+    }
+
+    size_t id = 0;
+
+    for (InstructionListItem* item = m_first; item != nullptr; item = item->next()) {
+        item->m_id = ++id;
+    }
+
+    for (InstructionListItem* item = m_first; item != nullptr; item = item->next()) {
+        SwappableArms arms;
+
+        if (!item->isInstruction() || item->group() != Instruction::DirectBranch
+            || !findSwappableArms(item->asInstruction(), arms)) {
+            continue;
+        }
+
+        Instruction* branch = item->asInstruction();
+        Label* elseLabel = branch->asExtended()->value().targetLabel;
+        Label* endLabel = arms.thenJump->asInstruction()->asExtended()->value().targetLabel;
+        InstructionListItem* thenFirst = branch->next();
+
+        branch->m_opcode = (branch->opcode() == ByteCode::JumpIfTrueOpcode) ? ByteCode::JumpIfFalseOpcode : ByteCode::JumpIfTrueOpcode;
+
+        branch->m_next = elseLabel->next();
+        arms.elseLast->m_next = arms.thenJump;
+        arms.thenJump->m_next = elseLabel;
+        elseLabel->m_next = thenFirst;
+        arms.thenLast->m_next = endLabel;
+    }
+}
+
 void JITCompiler::append(InstructionListItem* item)
 {
     ASSERT(item->m_next == nullptr);

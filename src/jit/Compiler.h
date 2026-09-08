@@ -797,6 +797,7 @@ public:
         m_moduleFunction = moduleFunction;
     }
 
+    void reorderHintedBranches();
     void buildVariables(uint32_t requiredStackSize);
     void allocateRegistersSimple();
     void allocateRegisters();
