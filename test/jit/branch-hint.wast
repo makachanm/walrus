@@ -1,4 +1,11 @@
 (module
+  (tag $except0 (param i32))
+
+  (func $throw (param i32)
+    local.get 0
+    throw $except0
+  )
+
   (func (export "swapped") (param i32 i32) (result i32)
     local.get 0
     (@metadata.code.branch_hint "\01")
@@ -118,6 +125,140 @@
       end
     end
   )
+
+  (func (export "tryouter") (param i32 i32) (result i32)
+    try (result i32)
+      local.get 0
+      (@metadata.code.branch_hint "\01")
+      if (result i32)
+        local.get 1
+        call $throw
+        i32.const 0
+      else
+        local.get 1
+        i32.const 1
+        i32.add
+      end
+    catch $except0
+      i32.const 1000
+      i32.add
+    end
+  )
+
+  (func (export "tryinthen") (param i32 i32) (result i32)
+    local.get 0
+    (@metadata.code.branch_hint "\01")
+    if (result i32)
+      local.get 1
+      i32.const 1
+      i32.add
+      try (result i32)
+        local.get 1
+        call $throw
+        i32.const 0
+      catch $except0
+        i32.const 10
+        i32.add
+      end
+      i32.add
+    else
+      local.get 1
+      i32.const 2
+      i32.mul
+    end
+  )
+
+  (func (export "tryinboth") (param i32 i32) (result i32)
+    local.get 0
+    (@metadata.code.branch_hint "\01")
+    if (result i32)
+      local.get 1
+      i32.const 1
+      i32.add
+      try (result i32)
+        local.get 1
+        call $throw
+        i32.const 0
+      catch $except0
+        i32.const 100
+        i32.add
+      end
+      i32.add
+    else
+      local.get 1
+      i32.const 2
+      i32.add
+      try (result i32)
+        local.get 1
+        call $throw
+        i32.const 0
+      catch $except0
+        i32.const 200
+        i32.add
+      end
+      i32.add
+    end
+  )
+
+  (func (export "nestedtry") (param i32 i32) (result i32)
+    local.get 0
+    (@metadata.code.branch_hint "\01")
+    if (result i32)
+      local.get 1
+      i32.const 1
+      i32.add
+      try (result i32)
+        try (result i32)
+          local.get 1
+          call $throw
+          i32.const 0
+        catch $except0
+          i32.const 1
+          i32.add
+          call $throw
+          i32.const 0
+        end
+      catch $except0
+        i32.const 1000
+        i32.add
+      end
+      i32.add
+    else
+      local.get 1
+      i32.const 2
+      i32.add
+      try (result i32)
+        local.get 1
+        call $throw
+        i32.const 0
+      catch $except0
+        i32.const 2000
+        i32.add
+      end
+      i32.add
+    end
+  )
+
+  (func (export "elsetry") (param i32 i32) (result i32)
+    local.get 0
+    (@metadata.code.branch_hint "\01")
+    if (result i32)
+      local.get 1
+      i32.const 4
+      i32.mul
+    else
+      try (result i32)
+        local.get 1
+        call $throw
+        i32.const 0
+      catch $except0
+        i32.const 300
+        i32.add
+      end
+      i32.const 1
+      i32.add
+    end
+  )
 )
 
 (assert_return (invoke "swapped" (i32.const 0) (i32.const 5)) (i32.const 25))
@@ -136,3 +277,13 @@
 (assert_return (invoke "noelse" (i32.const 1) (i32.const 7)) (i32.const 107))
 (assert_return (invoke "elsebr" (i32.const 0) (i32.const 5)) (i32.const 25))
 (assert_return (invoke "elsebr" (i32.const 1) (i32.const 5)) (i32.const 10))
+(assert_return (invoke "tryouter" (i32.const 1) (i32.const 5)) (i32.const 1005))
+(assert_return (invoke "tryouter" (i32.const 0) (i32.const 5)) (i32.const 6))
+(assert_return (invoke "tryinthen" (i32.const 1) (i32.const 5)) (i32.const 21))
+(assert_return (invoke "tryinthen" (i32.const 0) (i32.const 5)) (i32.const 10))
+(assert_return (invoke "tryinboth" (i32.const 1) (i32.const 5)) (i32.const 111))
+(assert_return (invoke "tryinboth" (i32.const 0) (i32.const 5)) (i32.const 212))
+(assert_return (invoke "nestedtry" (i32.const 1) (i32.const 5)) (i32.const 1012))
+(assert_return (invoke "nestedtry" (i32.const 0) (i32.const 5)) (i32.const 2012))
+(assert_return (invoke "elsetry" (i32.const 1) (i32.const 5)) (i32.const 20))
+(assert_return (invoke "elsetry" (i32.const 0) (i32.const 5)) (i32.const 306))

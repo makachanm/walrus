@@ -21,6 +21,7 @@
 #include "jit/Compiler.h"
 #include "runtime/ObjectType.h"
 
+#include <algorithm>
 #include <map>
 
 namespace Walrus {
@@ -510,6 +511,11 @@ static bool findSwappableArms(Instruction* branch, SwappableArms& arms)
         return false;
     }
 
+    // swap moves this label to front, so it must not be the boundary of a try block.
+    if (elseLabel->info() & (Label::kHasTryInfo | Label::kHasCatchInfo)) {
+        return false;
+    }
+
     arms.thenLast = nullptr;
     arms.thenJump = nullptr;
 
@@ -580,11 +586,8 @@ static bool findSwappableArms(Instruction* branch, SwappableArms& arms)
 
 void JITCompiler::reorderHintedBranches()
 {
-    if (m_tryBlockStart < m_tryBlocks.size()) {
-        return;
-    }
-
     size_t id = 0;
+    bool swapped = false;
 
     for (InstructionListItem* item = m_first; item != nullptr; item = item->next()) {
         item->m_id = ++id;
@@ -610,7 +613,25 @@ void JITCompiler::reorderHintedBranches()
         arms.thenJump->m_next = elseLabel;
         elseLabel->m_next = thenFirst;
         arms.thenLast->m_next = endLabel;
+
+        id = branch->id();
+
+        for (InstructionListItem* it = branch; it != endLabel; it = it->next()) {
+            it->m_id = id++;
+        }
+
+        swapped = true;
     }
+
+    if (!swapped || m_tryBlockStart == m_tryBlocks.size()) {
+        return;
+    }
+
+    // Reorder the blocks to analysis can be functions
+    std::stable_sort(m_tryBlocks.begin() + m_tryBlockStart, m_tryBlocks.end(),
+                     [](const TryBlock& left, const TryBlock& right) -> bool {
+                         return left.start->id() < right.start->id();
+                     });
 }
 
 void JITCompiler::append(InstructionListItem* item)
