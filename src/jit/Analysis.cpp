@@ -17,6 +17,8 @@
 #if defined(WALRUS_ENABLE_JIT)
 
 #include "Walrus.h"
+
+#include <algorithm>
 #include "jit/Compiler.h"
 #include "runtime/GCArray.h"
 
@@ -34,6 +36,7 @@ struct DependencyGenContext {
     // Also uses: VariableList::kConstraints.
     static const uint8_t kOptReferenced = 1 << 0;
     static const uint8_t kOptDependencyComputed = 1 << 1;
+    static const uint8_t kOptNeeded = 1 << 2;
 
     static const VariableRef kNoRef = ~(VariableRef)0;
 
@@ -391,6 +394,35 @@ static bool checkSameConst(VariableList* variableList, DependencyGenContext::Dep
     dependencies.clear();
     dependencies.insert(constRef);
     return true;
+}
+
+static bool sameImmediateValue(VariableList* variableList, VariableRef first, VariableRef second)
+{
+    VariableList::Variable& firstVariable = variableList->variables[first];
+    VariableList::Variable& secondVariable = variableList->variables[second];
+
+    if (!(firstVariable.info & VariableList::kIsImmediate) || !(secondVariable.info & VariableList::kIsImmediate)) {
+        return false;
+    }
+
+    Instruction* firstInstr = firstVariable.u.immediate;
+    Instruction* secondInstr = secondVariable.u.immediate;
+
+    if (firstInstr->opcode() != secondInstr->opcode()) {
+        return false;
+    }
+
+    switch (firstInstr->opcode()) {
+    case ByteCode::Const32Opcode:
+        return reinterpret_cast<Const32*>(firstInstr->byteCode())->value() == reinterpret_cast<Const32*>(secondInstr->byteCode())->value();
+    case ByteCode::Const64Opcode:
+        return reinterpret_cast<Const64*>(firstInstr->byteCode())->value() == reinterpret_cast<Const64*>(secondInstr->byteCode())->value();
+    default:
+        ASSERT(firstInstr->opcode() == ByteCode::Const128Opcode);
+        return memcmp(reinterpret_cast<Const128*>(firstInstr->byteCode())->value(),
+                      reinterpret_cast<Const128*>(secondInstr->byteCode())->value(), 16)
+            == 0;
+    }
 }
 
 static VariableRef mergeVariables(VariableList* variableList, VariableRef head, VariableRef other)
@@ -755,94 +787,225 @@ void JITCompiler::buildVariables(uint32_t requiredStackSize)
     // Phase 2: the indirect instruction
     // references are computed for labels.
 
+    const uint8_t kSlotUnknown = 0;
+    const uint8_t kSlotConstant = 1;
+    const uint8_t kSlotVariable = 2;
+
+    std::vector<uint8_t> slotState(dependencySize, kSlotUnknown);
+    std::vector<VariableRef> slotValue(dependencySize, DependencyGenContext::kNoRef);
+    std::vector<size_t> slotRangeStart(dependencySize, VariableList::kRangeMax);
+    std::vector<size_t> slotRangeEnd(dependencySize, 0);
+    std::vector<uint8_t> slotConstraints(dependencySize, 0);
+    std::vector<size_t> pending;
+
     for (InstructionListItem* item = m_first; item != nullptr; item = item->next()) {
         if (!item->isLabel()) {
             continue;
         }
 
-        Label* currentLabel = item->asLabel();
-        size_t dependencyStart = currentLabel->m_dependencyStart;
-
-        // Compute the required size first
+        size_t dependencyStart = item->asLabel()->m_dependencyStart;
         size_t end = dependencyStart + requiredStackSize;
 
-        for (uint32_t i = dependencyStart; i < end; ++i) {
-            ASSERT(!(dependencyCtx.options[i] & DependencyGenContext::kOptDependencyComputed));
+        for (size_t i = dependencyStart; i < end; ++i) {
+            if (dependencyCtx.options[i] & DependencyGenContext::kOptReferenced) {
+                dependencyCtx.options[i] |= DependencyGenContext::kOptNeeded;
+                pending.push_back(i);
+            }
+        }
+    }
 
-            if (!(dependencyCtx.options[i] & DependencyGenContext::kOptReferenced)) {
+    std::vector<size_t> needed;
+
+    while (!pending.empty()) {
+        size_t index = pending.back();
+        size_t slot = index % requiredStackSize;
+
+        pending.pop_back();
+        needed.push_back(index);
+
+        for (auto it : dependencyCtx.dependencies[index]) {
+            if (VARIABLE_TYPE(it) != DependencyGenContext::Label) {
                 continue;
             }
 
-            std::vector<Label*> unprocessedLabels;
-            DependencyGenContext::DependencyList& dependencies = dependencyCtx.dependencies[i];
+            size_t source = VARIABLE_GET_LABEL(it)->m_dependencyStart + slot;
 
-            for (auto it : dependencies) {
-                if (VARIABLE_TYPE(it) == DependencyGenContext::Label) {
-                    unprocessedLabels.push_back(VARIABLE_GET_LABEL(it));
-                }
+            if (!(dependencyCtx.options[source] & DependencyGenContext::kOptNeeded)) {
+                dependencyCtx.options[source] |= DependencyGenContext::kOptNeeded;
+                pending.push_back(source);
             }
+        }
+    }
 
-            while (!unprocessedLabels.empty()) {
-                Label* label = unprocessedLabels.back();
-                DependencyGenContext::DependencyList& list = dependencyCtx.dependencies[i - dependencyStart + label->m_dependencyStart];
+    std::sort(needed.begin(), needed.end());
 
-                unprocessedLabels.pop_back();
+    bool changed = true;
 
-                for (auto it : list) {
-                    if (dependencies.insert(it)) {
-                        if (VARIABLE_TYPE(it) == DependencyGenContext::Label) {
-                            unprocessedLabels.push_back(VARIABLE_GET_LABEL(it));
-                        }
-                    }
-                }
-            }
+    while (changed) {
+        changed = false;
 
-            dependencyCtx.options[i] |= DependencyGenContext::kOptDependencyComputed;
-
-            // Compute variable dependencies.
-            if (checkSameConst(m_variableList, dependencies)) {
+        for (auto index : needed) {
+            if (slotState[index] == kSlotVariable) {
                 continue;
             }
 
-            VariableRef headRef = DependencyGenContext::kNoRef;
-            uint8_t options = 0;
-            size_t rangeStart = VariableList::kRangeMax;
-            size_t rangeEnd = dependencyCtx.maxDistance[currentLabel->m_dependencyStart / requiredStackSize];
+            size_t slot = index % requiredStackSize;
+            uint8_t state = kSlotUnknown;
+            VariableRef value = DependencyGenContext::kNoRef;
 
-            for (auto it : dependencies) {
+            for (auto it : dependencyCtx.dependencies[index]) {
+                VariableRef candidate;
+
                 if (VARIABLE_TYPE(it) == DependencyGenContext::Label) {
-                    Label* label = VARIABLE_GET_LABEL(it);
+                    size_t source = VARIABLE_GET_LABEL(it)->m_dependencyStart + slot;
 
-                    if (label == currentLabel) {
+                    if (slotState[source] == kSlotUnknown) {
                         continue;
                     }
 
-                    options |= dependencyCtx.options[label->m_dependencyStart + (i - dependencyStart)] & VariableList::kConstraints;
+                    if (slotState[source] == kSlotVariable) {
+                        state = kSlotVariable;
+                        break;
+                    }
+
+                    candidate = slotValue[source];
+                } else {
+                    candidate = VARIABLE_GET_REF(it);
+
+                    if (!(m_variableList->variables[candidate].info & VariableList::kIsImmediate)) {
+                        state = kSlotVariable;
+                        break;
+                    }
+                }
+
+                if (state == kSlotUnknown) {
+                    state = kSlotConstant;
+                    value = candidate;
+                } else if (!sameImmediateValue(m_variableList, value, candidate)) {
+                    state = kSlotVariable;
+                    break;
+                }
+            }
+
+            if (state != slotState[index]) {
+                slotState[index] = state;
+                slotValue[index] = state == kSlotConstant ? value : DependencyGenContext::kNoRef;
+                changed = true;
+            }
+        }
+
+        for (auto index : needed) {
+            if (slotState[index] != kSlotVariable) {
+                continue;
+            }
+
+            size_t slot = index % requiredStackSize;
+
+            for (auto it : dependencyCtx.dependencies[index]) {
+                if (VARIABLE_TYPE(it) != DependencyGenContext::Label) {
+                    continue;
+                }
+
+                size_t source = VARIABLE_GET_LABEL(it)->m_dependencyStart + slot;
+
+                if (slotState[source] != kSlotVariable) {
+                    slotState[source] = kSlotVariable;
+                    slotValue[source] = DependencyGenContext::kNoRef;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    changed = true;
+
+    while (changed) {
+        changed = false;
+
+        for (auto index : needed) {
+            if (slotState[index] != kSlotVariable) {
+                continue;
+            }
+
+            size_t slot = index % requiredStackSize;
+            VariableRef head = slotValue[index];
+            size_t rangeStart = slotRangeStart[index];
+            size_t rangeEnd = slotRangeEnd[index];
+            uint8_t constraints = slotConstraints[index];
+
+            if (head != DependencyGenContext::kNoRef) {
+                head = m_variableList->getMergeHead(head);
+            }
+
+            for (auto it : dependencyCtx.dependencies[index]) {
+                VariableRef candidate;
+
+                if (VARIABLE_TYPE(it) == DependencyGenContext::Label) {
+                    Label* label = VARIABLE_GET_LABEL(it);
+                    size_t source = label->m_dependencyStart + slot;
+                    size_t sourceEnd = dependencyCtx.maxDistance[label->m_dependencyStart / requiredStackSize];
 
                     if (rangeStart > label->id()) {
                         rangeStart = label->id();
                     }
 
-                    size_t end = dependencyCtx.maxDistance[label->m_dependencyStart / requiredStackSize];
-                    if (rangeEnd < end) {
-                        rangeEnd = end;
+                    if (rangeEnd < sourceEnd) {
+                        rangeEnd = sourceEnd;
                     }
-                    continue;
-                }
 
-                VariableRef ref = VARIABLE_GET_REF(it);
+                    constraints |= dependencyCtx.options[source] & VariableList::kConstraints;
 
-                if (headRef == DependencyGenContext::kNoRef) {
-                    headRef = m_variableList->getMergeHead(ref);
+                    if (rangeStart > slotRangeStart[source]) {
+                        rangeStart = slotRangeStart[source];
+                    }
+
+                    if (rangeEnd < slotRangeEnd[source]) {
+                        rangeEnd = slotRangeEnd[source];
+                    }
+
+                    constraints |= slotConstraints[source];
+                    candidate = slotValue[source];
+
+                    if (candidate == DependencyGenContext::kNoRef) {
+                        continue;
+                    }
                 } else {
-                    headRef = mergeVariables(m_variableList, headRef, ref);
+                    candidate = VARIABLE_GET_REF(it);
                 }
+
+                head = (head == DependencyGenContext::kNoRef)
+                    ? m_variableList->getMergeHead(candidate)
+                    : mergeVariables(m_variableList, head, candidate);
             }
 
-            ASSERT(headRef != DependencyGenContext::kNoRef);
+            if (head == DependencyGenContext::kNoRef) {
+                continue;
+            }
 
-            VariableList::Variable& variable = m_variableList->variables[headRef];
-            variable.info |= (options | dependencyCtx.options[i]) & VariableList::kConstraints;
+            if (slotValue[index] != head || slotRangeStart[index] != rangeStart
+                || slotRangeEnd[index] != rangeEnd || slotConstraints[index] != constraints) {
+                changed = true;
+            }
+
+            slotValue[index] = head;
+            slotRangeStart[index] = rangeStart;
+            slotRangeEnd[index] = rangeEnd;
+            slotConstraints[index] = constraints;
+
+            size_t ownEnd = dependencyCtx.maxDistance[index / requiredStackSize];
+
+            if (rangeEnd < ownEnd) {
+                rangeEnd = ownEnd;
+            }
+
+            VariableList::Variable& variable = m_variableList->variables[head];
+
+            if (variable.info & VariableList::kIsImmediate) {
+                variable.info -= VariableList::kIsImmediate;
+                variable.u.rangeStart = variable.rangeEnd;
+            }
+
+            variable.info |= (constraints | dependencyCtx.options[index]) & VariableList::kConstraints;
 
             if (variable.u.rangeStart > rangeStart) {
                 variable.u.rangeStart = rangeStart;
@@ -851,10 +1014,21 @@ void JITCompiler::buildVariables(uint32_t requiredStackSize)
             if (variable.rangeEnd < rangeEnd) {
                 variable.rangeEnd = rangeEnd;
             }
-
-            dependencies.clear();
-            dependencies.insert(VARIABLE_SET(headRef, DependencyGenContext::Variable));
         }
+    }
+
+    for (auto index : needed) {
+        if (!(dependencyCtx.options[index] & DependencyGenContext::kOptReferenced)) {
+            continue;
+        }
+
+        ASSERT(slotValue[index] != DependencyGenContext::kNoRef);
+
+        DependencyGenContext::DependencyList& dependencies = dependencyCtx.dependencies[index];
+
+        dependencies.clear();
+        dependencies.insert(VARIABLE_SET(slotValue[index], DependencyGenContext::Variable));
+        dependencyCtx.options[index] |= DependencyGenContext::kOptDependencyComputed;
     }
 
     // Cleanup
